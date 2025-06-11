@@ -1106,7 +1106,8 @@ async def main():
     scanner = NetworkScanner(state)
     # Test avec une cible sans WAF pour validation (recommandation)
     logger.info("Test recommandé : scan sur scanme.nmap.org ou IP directe comme 8.8.8.8")
-    result = await scanner.do_full_scan_on_port("8.8.8.8", 53, domain=None)  # Test avec IP directe
+    result = await scanner.do_full_scan_on_port("scanme.nmap.org", 80, domain="scanme.nmap.org")  # Test avec IP nmap directe
+    #result = await scanner.do_full_scan_on_port("8.8.8.8", 53, domain=None)  # Test avec IP directe
     print(result)
 
 if __name__ == "__main__":
