@@ -30,12 +30,19 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 
 # Ajustement des paramètres de configuration pour répondre aux recommandations
 APP_CONFIG.MAX_PARALLEL = 50  # Réduit pour limiter la surcharge réseau
-APP_CONFIG.TIMEOUT = 2  # Augmenté à 2 secondes pour permettre des réponses lentes
+APP_CONFIG.TIMEOUT = 3  # Augmenté à 3 secondes pour permettre des réponses lentes
 APP_CONFIG.RETRY_BACKOFF_FACTOR = 2  # Facteur de backoff pour les tentatives
 APP_CONFIG.MAX_RETRIES = 3  # Nombre maximum de tentatives
 APP_CONFIG.USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (Mac OSX 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.2210.61",
+    "Googlebot/2.1 (+http://www.google.com/bot.html)",
+    "Googlebot-Image/1.0",
     "ShopifyBot/1.0 (+https://shopify.com)"
 ]
 
@@ -84,9 +91,18 @@ class NetworkScanner:
         self.semaphore: asyncio.Semaphore = asyncio.Semaphore(self.config.MAX_PARALLEL) # Utiliser self.config ici
         self.lstm_model: Optional[LSTMModel] = self._load_lstm_model()
         self.service_signatures: Dict[str, Dict] = {
-            "ssh": {"window": [0, 65535], "ttl": [64, 128], "flags": ["SA", "R"], "confidence": 0.7},
-            "http": {"window": [8192, 32768], "ttl": [64, 128], "flags": ["SA", "R"], "confidence": 0.6},
-            "firewall": {"icmp_type": 3, "confidence": 0.8}
+            "ssh": {"window": [0, 65535], "ttl": [50, 128], "flags": ["SA", "R"], "confidence": 0.7}, # General TTL range
+            "http": {"window": [8000, 65535], "ttl": [50, 128], "flags": ["SA", "R"], "confidence": 0.6},
+            "https": {"window": [10000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.65}, # Often larger windows
+            "ftp": {"window": [4000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.65},
+            "smtp": {"window": [4000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.65},
+            "dns_tcp": {"window": [1000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.6}, # DNS over TCP
+            "pop3": {"window": [4000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.65},
+            "imap": {"window": [4000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.65},
+            "rdp": {"window": [8000, 65535], "ttl": [100, 128], "flags": ["SA"], "confidence": 0.7}, # Often Windows so higher TTL start
+            "postgresql": {"window": [4000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.7},
+            "mysql": {"window": [4000, 65535], "ttl": [50, 128], "flags": ["SA"], "confidence": 0.7},
+            "firewall": {"icmp_type": 3, "confidence": 0.8} # ICMP based detection
         }
         self.response_times: List[float] = []
         self.proxies: List[Dict[str, str]] = self._load_proxies()
@@ -352,8 +368,12 @@ class NetworkScanner:
                     logger.debug(f"Scan TCP connect : {ip}:{port} fermé ou filtré (tentative {attempt+1}) : {e}")
                     self.packet_loss_count += 1 # Incrémenter le compteur de pertes de paquets/erreurs
                     if attempt < self.config.MAX_RETRIES - 1:
-                        # Attendre un court instant avant la prochaine tentative
-                        await asyncio.sleep(random.uniform(0.1, 0.5))
+                        # Refined retry backoff logic
+                        base_sleep = self.config.RETRY_BACKOFF_FACTOR * (attempt + 1) * 0.1  # Scale it down
+                        jitter = random.uniform(0.05, 0.15)
+                        sleep_duration = min(1.5, base_sleep + jitter) # Cap at 1.5s
+                        logger.debug(f"TCP connect retry {attempt+1} for {ip}:{port}, sleeping for {sleep_duration:.2f}s")
+                        await asyncio.sleep(sleep_duration)
             
             # Si toutes les tentatives de connexion TCP standard échouent,
             # utiliser une méthode de sonde plus avancée (SYN scan like) pour affiner le diagnostic.
@@ -447,7 +467,12 @@ class NetworkScanner:
                 logger.error(f"Erreur lors de la sonde avancée sur {ip}:{port} (tentative {attempt+1}) : {e}", exc_info=True)
                 self.packet_loss_count += 1
                 if attempt < self.config.MAX_RETRIES - 1: # Attendre avant la prochaine tentative
-                    await asyncio.sleep(random.uniform(0.1, 0.5))
+                    # Refined retry backoff logic
+                    base_sleep = self.config.RETRY_BACKOFF_FACTOR * (attempt + 1) * 0.1
+                    jitter = random.uniform(0.05, 0.15)
+                    sleep_duration = min(1.5, base_sleep + jitter) # Cap at 1.5s
+                    logger.debug(f"Probe advanced retry {attempt+1} for {ip}:{port}, sleeping for {sleep_duration:.2f}s")
+                    await asyncio.sleep(sleep_duration)
         
         # Si toutes les tentatives échouent
         logger.warning(f"Scan avancé échoué pour {ip}:{port} après {self.config.MAX_RETRIES} tentatives")
@@ -1159,6 +1184,76 @@ class NetworkScanner:
                 },
                 "url_param": "/?rand=" + str(random.randint(1000, 9999)),
                 "method": "GET"
+            },
+            {
+                "name": "GET with X-Forwarded-Host",
+                "headers": {
+                    "User-Agent": random.choice(self.config.USER_AGENTS),
+                    "X-Forwarded-Host": domain or ip,
+                    "Host": domain or ip,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                },
+                "url_param": "/?fwdhost=" + str(random.randint(1000,9999)),
+                "method": "GET"
+            },
+            {
+                "name": "GET with X-Client-IP",
+                "headers": {
+                    "User-Agent": random.choice(self.config.USER_AGENTS),
+                    "X-Client-IP": f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",
+                    "Host": domain or ip,
+                },
+                "url_param": "/?clientip=" + str(random.randint(1000,9999)),
+                "method": "GET"
+            },
+            {
+                "name": "GET with X-Real-IP",
+                "headers": {
+                    "User-Agent": random.choice(self.config.USER_AGENTS),
+                    "X-Real-IP": f"172.16.{random.randint(0,255)}.{random.randint(1,254)}",
+                    "Host": domain or ip,
+                },
+                "url_param": "/?realip=" + str(random.randint(1000,9999)),
+                "method": "GET"
+            },
+            {
+                "name": "GET with CF-Connecting-IP",
+                "headers": {
+                    "User-Agent": random.choice(self.config.USER_AGENTS),
+                    "CF-Connecting-IP": f"203.0.113.{random.randint(1,254)}", # Example public IP range
+                    "Host": domain or ip,
+                },
+                "url_param": "/?cfip=" + str(random.randint(1000,9999)),
+                "method": "GET"
+            },
+            {
+                "name": "GET with URL Encoded Parameter",
+                "headers": {
+                    "User-Agent": random.choice(self.config.USER_AGENTS),
+                    "Host": domain or ip,
+                },
+                "url_param": "?param=%62%79%70%61%73%73&val=" + str(random.randint(1000,9999)), # bypass
+                "method": "GET"
+            },
+            {
+                "name": "GET with Parameter Pollution",
+                "headers": {
+                    "User-Agent": random.choice(self.config.USER_AGENTS),
+                    "Host": domain or ip,
+                },
+                "url_param": "?id=1&id=2&id=3&test=pollution&rand=" + str(random.randint(1000,9999)),
+                "method": "GET"
+            },
+            {
+                "name": "POST with application/x-www-form-urlencoded",
+                "headers": {
+                    "User-Agent": random.choice(self.config.USER_AGENTS),
+                    "Host": domain or ip,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                "url_param": "/submit?postbypass=" + str(random.randint(1000,9999)),
+                "method": "POST",
+                "data": "field1=value1&field2=value2_bypass"
             }
         ]
 
@@ -1169,8 +1264,16 @@ class NetworkScanner:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context_aiohttp, limit_per_host=5)) as session:
             for attempt_num, payload_info in enumerate(payloads):
                 current_headers: Dict[str, str] = payload_info["headers"] # type: ignore
+                # Ensure Host is correctly set if not already in the payload's headers
+                if "Host" not in current_headers:
+                    current_headers["Host"] = domain or ip
+                # Ensure User-Agent is set, potentially overriding if one was already there, to ensure rotation
+                current_headers["User-Agent"] = random.choice(self.config.USER_AGENTS)
+
                 current_url: str = target_url + payload_info.get("url_param", "")
                 method: str = payload_info["method"] # type: ignore
+                data_for_post: Optional[str] = payload_info.get("data") # For POST requests
+
                 current_proxy: Optional[Dict[str, str]] = self._get_next_proxy()
                 proxy_url: Optional[str] = current_proxy.get("http") if current_proxy else None # Utiliser la clé "http" pour aiohttp
 
@@ -1178,39 +1281,68 @@ class NetworkScanner:
                 
                 try:
                     async with asyncio.timeout(self.config.TIMEOUT): # Timeout par tentative
-                        async with session.request(method, current_url, headers=current_headers, proxy=proxy_url, allow_redirects=False) as response:
+                        request_kwargs = {
+                            "headers": current_headers,
+                            "proxy": proxy_url,
+                            "allow_redirects": False
+                        }
+                        if method == "POST" and data_for_post is not None:
+                            request_kwargs["data"] = data_for_post
+
+                        async with session.request(method, current_url, **request_kwargs) as response: # type: ignore
                             status: int = response.status
                             # Lire le corps pour l'analyse, même si c'est une requête HEAD (le corps sera vide)
                             response_text: str = await response.text(errors='ignore') 
                             
-                            # Détection de WAF basique
+                            # Détection de WAF améliorée
                             server_header: str = response.headers.get("Server", "").lower()
-                            waf_keywords: List[str] = ["cloudflare", "akamai", "sucuri", "incapsula", "barracuda", "f5", "mod_security", "awswaf", "shieldsquare", "imperva"]
                             response_content_lower: str = response_text.lower()
-                            headers_lower: str = str(response.headers).lower()
+                            headers_lower_str: str = str(response.headers).lower() # For general keyword search
 
                             detected_waf_name: str = "none"
-                            for kw in waf_keywords:
-                                if kw in server_header or kw in response_content_lower or kw in headers_lower:
-                                    detected_waf_name = kw
-                                    break
+
+                            # Prioritized specific checks
+                            if "X-Akamai-Transformed" in response.headers or "X-Cache" in response.headers and "akamai" in response.headers["X-Cache"].lower():
+                                detected_waf_name = "akamai_waf"
+                            elif "awselb" in server_header or "x-amz-cf-id" in response.headers or "awselb/2.0" in server_header:
+                                detected_waf_name = "aws_waf"
+                            elif "Request blocked by AWS WAF" in response_text or "AWS WAF" in response_text:
+                                detected_waf_name = "aws_waf"
+                            elif "X-Sucuri-ID" in response.headers or "X-Sucuri-Cache" in response.headers or "sucuri" in server_header:
+                                detected_waf_name = "sucuri_waf"
+                            elif "BIGipServer" in response.headers.get("Set-Cookie", "") or "BIG-IP" in server_header or "big-ip" in server_header:
+                                detected_waf_name = "f5_bigip_waf"
+                            elif "wordfence" in response_content_lower or "wf-scan-done" in response.headers:
+                                detected_waf_name = "wordfence_waf"
+                            elif "mod_security" in response_content_lower or "noyb" in response_content_lower or "modsecurity" in server_header:
+                                detected_waf_name = "modsecurity_waf"
+                            elif "cloudflare" in server_header or "cf-ray" in response.headers: # Cloudflare check
+                                detected_waf_name = "cloudflare"
+                            # Generic keyword check if no specific WAF found yet
+                            elif detected_waf_name == "none":
+                                general_waf_keywords: List[str] = ["incapsula", "barracuda", "shieldsquare", "imperva"] # Removed already specific ones
+                                for kw in general_waf_keywords:
+                                    if kw in server_header or kw in response_content_lower or kw in headers_lower_str:
+                                        detected_waf_name = kw + "_waf" # Mark as generic WAF
+                                        break
                             
-                            results["waf_detected"] = detected_waf_name # Mettre à jour le WAF détecté à chaque tentative
+                            results["waf_detected"] = detected_waf_name # Mettre à jour le WAF détecté
 
                             if 200 <= status < 300: # Succès si status 2xx
                                 results.update({
                                     "bypass_success": True,
                                     "confidence": 0.95,
+                                    # Utiliser le detected_waf_name, s'il est "none" après les vérifications, marquer comme "bypassed_unknown_waf"
                                     "waf_detected": detected_waf_name if detected_waf_name != "none" else "bypassed_unknown_waf",
                                     "bypass_method": payload_info["name"] # type: ignore
                                 })
                                 logger.info(f"WAF bypass: Succès pour {current_url} (status {status}) avec méthode '{payload_info['name']}'. WAF: {results['waf_detected']}")
                                 return results # Sortir dès le premier succès
                             elif status in [403, 406, 429, 500, 503]: # Codes d'erreur typiques de WAF ou de serveur surchargé
-                                results.update({"confidence": 0.85, "bypass_success": False})
+                                results.update({"confidence": 0.85, "bypass_success": False}) # WAF detected name is already in results["waf_detected"]
                                 logger.info(f"WAF bypass: Bloqué pour {current_url} (status {status}) avec méthode '{payload_info['name']}'. WAF: {results['waf_detected']}")
                             else: # Autres status
-                                results.update({"confidence": 0.80, "bypass_success": False})
+                                results.update({"confidence": 0.80, "bypass_success": False}) # WAF detected name is already in results["waf_detected"]
                                 logger.debug(f"WAF bypass: Status {status} pour {current_url} avec méthode '{payload_info['name']}'. WAF: {results['waf_detected']}")
                     
                 except asyncio.TimeoutError:
@@ -1224,7 +1356,7 @@ class NetworkScanner:
                     self.packet_loss_count += 1
 
                 if attempt_num < len(payloads) - 1: # Ne pas attendre après la dernière tentative
-                    await asyncio.sleep(random.uniform(0.2, 0.7)) # Délai un peu plus long entre les tentatives de bypass WAF
+                    await asyncio.sleep(random.uniform(0.5, 1.5)) # Délai randomisé et un peu plus long
 
         logger.info(f"WAF bypass: Toutes les {len(payloads)} tentatives ont échoué pour {target_url}. Dernier WAF détecté: {results['waf_detected']}")
         return results
@@ -1286,38 +1418,61 @@ class NetworkScanner:
                             
                             results["banner"] = banner_text[:500] # Stocker un extrait de la bannière
                             server_header: str = response.headers.get("Server", "").lower() # En-tête Server
+                            response_content_lower: str = banner_text.lower() # banner_text is the response body here
+                            headers_lower_str: str = str(response.headers).lower()
+
+                            current_protection: str = "unknown_or_none"
+
+                            # Specific WAF/CDN checks (prioritized)
+                            if "cloudflare" in server_header or "cf-ray" in response.headers or "cf-" in headers_lower_str or \
+                               ("expect-ct" in response.headers and "cloudflare" in response.headers["expect-ct"].lower()):
+                                current_protection = "cloudflare"
+                            elif "X-Akamai-Transformed" in response.headers or ("X-Cache" in response.headers and "akamai" in response.headers["X-Cache"].lower()):
+                                current_protection = "akamai_waf"
+                            elif "awselb" in server_header or "x-amz-cf-id" in response.headers or "awselb/2.0" in server_header or \
+                                 "Request blocked by AWS WAF" in banner_text or "AWS WAF" in banner_text: # banner_text is response_text
+                                current_protection = "aws_waf"
+                            elif "X-Sucuri-ID" in response.headers or "X-Sucuri-Cache" in response.headers or "sucuri" in server_header:
+                                current_protection = "sucuri_waf"
+                            elif "BIGipServer" in response.headers.get("Set-Cookie", "") or "BIG-IP" in server_header or "big-ip" in server_header:
+                                current_protection = "f5_bigip_waf"
+                            elif "wordfence" in response_content_lower or "wf-scan-done" in response.headers:
+                                current_protection = "wordfence_waf"
+                            elif "mod_security" in response_content_lower or "noyb" in response_content_lower or "modsecurity" in server_header:
+                                current_protection = "modsecurity_waf"
+                            # Generic keyword check if no specific WAF found yet and not Cloudflare
+                            elif current_protection == "unknown_or_none":
+                                general_waf_keywords: List[str] = ["incapsula", "barracuda", "shieldsquare", "imperva"]
+                                for kw in general_waf_keywords:
+                                    if kw in server_header or kw in response_content_lower or kw in headers_lower_str:
+                                        current_protection = kw + "_waf"
+                                        break
                             
-                            # Détection de Cloudflare basée sur les en-têtes et le contenu
-                            is_cloudflare_present: bool = (
-                                "cloudflare" in server_header or 
-                                "cf-ray" in response.headers or # En-tête spécifique à Cloudflare
-                                "cf-" in str(response.headers).lower() or 
-                                ("expect-ct" in response.headers and "cloudflare" in response.headers["expect-ct"].lower())
-                            )
-                            # Détection spécifique de Shopify
-                            is_shopify_site: bool = "shopify" in banner_text.lower() or "cdn.shopify.com" in banner_text.lower()
+                            is_shopify_site: bool = "shopify" in response_content_lower or "cdn.shopify.com" in response_content_lower
+                            if current_protection == "unknown_or_none" and is_shopify_site:
+                                current_protection = "shopify_platform"
+
 
                             if status == 200: # Si la requête est réussie (status 200 OK)
                                 results.update({
                                     "service": "https" if scheme == "https" else "http",
                                     "version": "Shopify" if is_shopify_site else (server_header if server_header else "Unknown WebServer"),
                                     "confidence": 0.95,
-                                    "bypass_success": True, # La sonde a réussi à accéder directement
-                                    "protection": "cloudflare" if is_cloudflare_present else ("shopify_platform" if is_shopify_site else "unknown_or_none")
+                                    "bypass_success": True,
+                                    "protection": current_protection
                                 })
                                 logger.info(f"Cloudflare stealth probe: Accès direct réussi pour {target_url} (status 200). Protection: {results['protection']}")
                                 return results # Succès, retourner immédiatement
-                            elif status in [403, 503, 429] or (status == 520 and is_cloudflare_present): # Codes d'erreur typiques de Cloudflare ou WAF
+                            elif status in [403, 503, 429] or (status == 520 and current_protection == "cloudflare"): # Codes d'erreur typiques de WAF
                                 results.update({
-                                    "protection": "cloudflare" if is_cloudflare_present else "blocked_generic", # Marquer comme bloqué par Cloudflare ou générique
+                                    "protection": current_protection if current_protection != "unknown_or_none" else "blocked_generic",
                                     "confidence": 0.90,
                                     "bypass_success": False
                                 })
                                 logger.info(f"Cloudflare stealth probe: Bloqué pour {target_url} (status {status}). Protection: {results['protection']}")
-                                # Continuer les tentatives, car le blocage peut être temporaire ou spécifique au proxy/UA
                             else: # Autres codes de statut inattendus
-                                results.update({"confidence": 0.80, "bypass_success": False, "protection": "unknown"})
-                                logger.debug(f"Cloudflare stealth probe: Status {status} inattendu pour {target_url}.")
+                                results.update({"confidence": 0.80, "bypass_success": False, "protection": current_protection})
+                                logger.debug(f"Cloudflare stealth probe: Status {status} inattendu pour {target_url}. Protection: {current_protection}")
                 
             except asyncio.TimeoutError: # Gérer les timeouts de requête
                 logger.debug(f"Cloudflare stealth probe: Timeout pour {target_url} (tentative {attempt+1})")
@@ -1436,8 +1591,9 @@ class NetworkScanner:
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-gpu")
-            # Utiliser un User-Agent spécifique pour Selenium pour le distinguer des requêtes aiohttp
-            chrome_options.add_argument(f"--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36 Selenium")
+            # Randomize User-Agent from the global list
+            random_user_agent = random.choice(self.config.USER_AGENTS)
+            chrome_options.add_argument(f"--user-agent={random_user_agent}")
 
             current_proxy: Optional[Dict[str, str]] = self._get_next_proxy() # Obtenir un proxy pour cette tentative Selenium
             if current_proxy and "http" in current_proxy: # Assurer que la clé http existe
@@ -1463,7 +1619,7 @@ class NetworkScanner:
             
             # Attente initiale pour que la page se charge et que les scripts JS s'exécutent.
             # Cette attente est cruciale pour les pages avec des défis JS.
-            time.sleep(self.config.TIMEOUT + 3) # Ex: 2s + 3s = 5s. Ajuster si nécessaire.
+            time.sleep(self.config.TIMEOUT + random.uniform(2.5, 4.0)) # Randomized sleep
 
             page_title_lower: str = driver.title.lower()
             page_source_snippet_lower: str = driver.page_source[:1000].lower() # Examiner un extrait pour performance
@@ -1475,7 +1631,7 @@ class NetworkScanner:
 
             if is_challenge_detected:
                 logger.info(f"Sync JS challenge: Défi JS ou page d'attente détecté pour {target_url}. Attente supplémentaire.")
-                time.sleep(self.config.TIMEOUT + 7) # Attente plus longue, ex: 2s + 7s = 9s
+                time.sleep(self.config.TIMEOUT + random.uniform(6.0, 8.5)) # Randomized sleep
 
                 # Ré-évaluer après l'attente
                 page_title_lower = driver.title.lower()
@@ -1568,7 +1724,14 @@ class NetworkScanner:
                             self.packet_loss_count += 1
                     
                     if attempt < self.config.MAX_RETRIES - 1: # Délai avant la prochaine tentative
-                        await asyncio.sleep(random.uniform(self.config.RETRY_BACKOFF_FACTOR, self.config.RETRY_BACKOFF_FACTOR * 2))
+                        # Exponential backoff with jitter
+                        base_delay = self.config.RETRY_BACKOFF_FACTOR ** (attempt + 1)
+                        jitter = random.uniform(0, 0.5)
+                        calculated_delay = base_delay + jitter
+                        # Cap the delay to a maximum of 10 seconds
+                        delay_to_apply = min(10, calculated_delay)
+                        logger.debug(f"Cloudflare rate limit evasion: Applying exponential backoff delay of {delay_to_apply:.2f}s (attempt {attempt+1})")
+                        await asyncio.sleep(delay_to_apply)
 
         except asyncio.TimeoutError: # Timeout global pour toutes les tentatives
             logger.warning(f"Cloudflare rate limit evasion: Timeout global pour {target_url} après {self.config.MAX_RETRIES} tentatives.")
@@ -1980,6 +2143,25 @@ class NetworkScanner:
             else: # Cas d'erreur ou autre statut
                  port_results["inferred_state"] = f"état_incertain ({port_results['status']})"
 
+            # Adjust confidence if WAF is detected and not bypassed
+            # Ensure 'protection' key exists and is a string before calling .lower()
+            protection_status = port_results.get("protection", "none")
+            if not isinstance(protection_status, str): # Ensure it's a string for .lower()
+                protection_status = "none"
+
+            is_waf_actively_blocking = (
+                "waf" in protection_status.lower() or
+                "cloudflare" in protection_status.lower() or
+                "firewall" in protection_status.lower()
+            ) and \
+            not port_results.get("waf_bypass_info", {}).get("bypass_success", False) and \
+            not port_results.get("cloudflare_info", {}).get("bypass_success", False)
+
+            if port_results["status"] == "open" and is_waf_actively_blocking:
+                original_confidence = port_results.get("confidence", 0.7)
+                port_results["confidence"] = max(0.5, original_confidence - 0.15)
+                logger.info(f"Port {ip}:{port} is open but WAF ({port_results['protection']}) is detected and not bypassed. Confidence adjusted from {original_confidence:.2f} to {port_results['confidence']:.2f}.")
+
 
             # Log si des pertes de paquets ont été enregistrées pendant le scan de ce port.
             # Note: `packet_loss_count` est un compteur global. Pour un suivi par port, il faudrait une logique différente.
@@ -1994,7 +2176,7 @@ class NetworkScanner:
             port_results["errors"].append(error_message) # Ajouter l'erreur aux résultats du port
             port_results["status"] = "error_orchestration" # Statut spécifique pour indiquer une erreur d'orchestration
         
-        logger.info(f"Scan complet terminé pour {ip}:{port}. Statut final: {port_results['status']}, Service: {port_results['service']}")
+        logger.info(f"Scan complet terminé pour {ip}:{port}. Statut final: {port_results['status']}, Service: {port_results['service']}, Protection: {port_results.get('protection', 'N/A')}, Confidence: {port_results.get('confidence', 0.0):.2f}")
         return port_results
 
     async def scan_all_ports(self, ip: str, domain: Optional[str] = None) -> List[Dict[str, Any]]:
