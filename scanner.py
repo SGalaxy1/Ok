@@ -15,7 +15,12 @@ from typing import List, Dict, Optional, Set
 from scapy.all import IP, TCP, UDP, ICMP, sr1, RandShort
 from datetime import datetime
 import dns.resolver
-import torch
+try:
+    import torch
+except (ImportError, OSError) as e:
+    torch = None
+    logger = logging.getLogger(__name__) # Ensure logger is available
+    logger.warning(f"PyTorch could not be imported or is corrupted ({e}). LSTM model features will be disabled.")
 from network_tool.config import APP_CONFIG
 from network_tool.state import ScannerState
 from network_tool.models import LSTMModel  # Import du modèle LSTM
@@ -101,33 +106,8 @@ class NetworkScanner:
         Returns:
             Optional[LSTMModel]: Le modèle LSTM chargé ou initialisé, ou None en cas d'erreur majeure.
         """
-        try:
-            model: LSTMModel = LSTMModel(input_size=6, hidden_size=128, num_layers=2, output_size=10) # Initialisation de l'architecture du modèle
-            model_path: str = "data.pkl" # Chemin vers le fichier de poids pré-entraînés
-            
-            # Charger le modèle sur GPU si disponible, sinon CPU
-            if torch.cuda.is_available():
-                model = model.cuda()
-                state_dict = torch.load(model_path, map_location=torch.device('cuda')) # Charger les poids pour CUDA
-            else:
-                state_dict = torch.load(model_path, map_location=torch.device('cpu')) # Charger les poids pour CPU
-            
-            model.load_state_dict(state_dict) # Appliquer les poids chargés au modèle
-            model.eval() # Mettre le modèle en mode évaluation (désactive dropout, etc.)
-            logger.info(f"Modèle LSTM chargé avec succès depuis {model_path}")
-            return model
-        except FileNotFoundError:
-            # Si le fichier de poids n'est pas trouvé, initialiser un nouveau modèle (non entraîné)
-            logger.error(f"Échec du chargement des poids du modèle LSTM : Fichier {model_path} introuvable. Initialisation avec des poids aléatoires.")
-            model: LSTMModel = LSTMModel(input_size=6, hidden_size=128, num_layers=2, output_size=10)
-            if torch.cuda.is_available():
-                model = model.cuda()
-            model.eval()
-            return model
-        except Exception as e:
-            # Gérer toute autre erreur pendant le chargement
-            logger.error(f"Erreur inattendue lors du chargement du modèle LSTM : {e}", exc_info=True)
-            return None
+        logger.info("Torch is not available or model loading is disabled. LSTM model will not be used.")
+        return None
 
     def _load_proxies(self) -> List[Dict[str, str]]:
         """
@@ -187,7 +167,7 @@ class NetworkScanner:
         logger.debug(f"Utilisation de l'IP source : {source_ip}")
         return source_ip
 
-    def _extract_features(self, pkt: IP, response_time: float) -> torch.Tensor:
+    def _extract_features(self, pkt: IP, response_time: float) -> Any:
         """
         Extrait les caractéristiques d'un paquet réseau pour l'alimentation du modèle LSTM.
 
@@ -199,6 +179,11 @@ class NetworkScanner:
             torch.Tensor: Un tenseur contenant les caractéristiques extraites.
                           Retourne un tenseur par défaut en cas d'erreur.
         """
+        if torch is None:
+            logger.debug("Torch not available, cannot extract features for LSTM. Returning default.")
+            # Return a structure that matches what torch.tensor([[features]]) would produce in terms of list depth
+            return [[0.0] * 6]
+
         try:
             # Extraction des caractéristiques: TTL, taille de fenêtre TCP, longueur du paquet IP, temps de réponse, présence ICMP, nombre d'options TCP.
             # Des valeurs par défaut sont utilisées si une caractéristique ne peut être extraite.
@@ -216,12 +201,12 @@ class NetworkScanner:
             # Retourner un tenseur de caractéristiques par défaut en cas d'erreur
             return torch.tensor([[64.0, 0.0, 0.0, response_time, 0.0, 0.0]], dtype=torch.float32)
 
-    def _predict_service_lstm(self, features: torch.Tensor) -> tuple[str, float]:
+    def _predict_service_lstm(self, features: Any) -> tuple[str, float]:
         """
         Prédit le service réseau en utilisant le modèle LSTM.
 
         Args:
-            features (torch.Tensor): Le tenseur de caractéristiques extrait du paquet.
+            features (Any): Le tenseur de caractéristiques extrait du paquet.
 
         Returns:
             tuple[str, float]: Un tuple contenant le nom du service prédit et le score de confiance.
@@ -229,8 +214,22 @@ class NetworkScanner:
         """
         if not self.lstm_model: # Vérifier si le modèle LSTM est chargé
             return "unknown", 0.5
+
+        # If torch was not imported, or lstm_model is None, this part won't run anyway due to the check above.
+        # However, if torch is None, features might not be a tensor, so direct tensor operations would fail.
+        # The check `if not self.lstm_model` effectively makes this safe.
+        if torch is None: # Explicitly ensure no torch operations if torch is None
+            logger.debug("Torch not available, LSTM prediction skipped.")
+            return "unknown", 0.5
+
         try:
             with torch.no_grad(): # Désactiver le calcul du gradient pour l'inférence
+                # Ensure features is a tensor if torch is available.
+                # _extract_features should provide a tensor or a list of lists.
+                if not isinstance(features, torch.Tensor):
+                    # Attempt to convert if it's the expected list-of-lists structure
+                    features = torch.tensor(features, dtype=torch.float32)
+
                 output: torch.Tensor = self.lstm_model(features) # Obtenir la sortie brute du modèle
                 # Appliquer softmax pour obtenir des probabilités et prendre l'argmax pour la classe prédite
                 service_idx: int = torch.argmax(output, dim=1).item() # Index du service avec la plus haute probabilité
@@ -886,9 +885,9 @@ class NetworkScanner:
             self.packet_loss_count += 1 # Compter comme une perte/erreur
         return results
 
-def _sync_advanced_ssl_analysis(self, ip: str, port: int, hostname: Optional[str]) -> Dict[str, Any]:
-    """
-    Fonction synchrone pour l'analyse SSL. Destinée à être exécutée dans un thread.
+    def _sync_advanced_ssl_analysis(self, ip: str, port: int, hostname: Optional[str]) -> Dict[str, Any]:
+        """
+        Fonction synchrone pour l'analyse SSL. Destinée à être exécutée dans un thread.
 
     Args:
         ip (str): L'adresse IP cible.
@@ -898,51 +897,51 @@ def _sync_advanced_ssl_analysis(self, ip: str, port: int, hostname: Optional[str
     Returns:
         Dict[str, Any]: Dictionnaire des détails SSL.
     """
-    results: Dict[str, Any] = {"issuer": "", "san_domains": [], "not_after": "", "serial_number": "", "confidence": 0.0, "error": "", "protocols": [], "cipher": ""}
-    context = ssl.create_default_context(cafile=certifi.where())
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_OPTIONAL
-    try:
-        with socket.create_connection((ip, port), timeout=self.config.TIMEOUT) as sock:
-            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                cert_dict: Optional[Dict[str, Any]] = ssock.getpeercert()
-                if cert_dict:
-                    issuer_tuples: List[Tuple[Tuple[str, str], ...]] = cert_dict.get("issuer", [])
-                    issuer_info_list: List[Tuple[str, str]] = [item for sublist in issuer_tuples for item in sublist]  # type: ignore
-                    issuer_dict: Dict[str, str] = dict(issuer_info_list)
+        results: Dict[str, Any] = {"issuer": "", "san_domains": [], "not_after": "", "serial_number": "", "confidence": 0.0, "error": "", "protocols": [], "cipher": ""}
+        context = ssl.create_default_context(cafile=certifi.where())
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_OPTIONAL
+        try:
+            with socket.create_connection((ip, port), timeout=self.config.TIMEOUT) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cert_dict: Optional[Dict[str, Any]] = ssock.getpeercert()
+                    if cert_dict:
+                        issuer_tuples: List[Tuple[Tuple[str, str], ...]] = cert_dict.get("issuer", [])
+                        issuer_info_list: List[Tuple[str, str]] = [item for sublist in issuer_tuples for item in sublist]  # type: ignore
+                        issuer_dict: Dict[str, str] = dict(issuer_info_list)
 
-                    san_tuples: List[Tuple[str, str]] = cert_dict.get("subjectAltName", [])
-                    protocol_version: Optional[str] = ssock.version()
-                    cipher_info: Optional[Tuple[str, str, int]] = ssock.cipher()
+                        san_tuples: List[Tuple[str, str]] = cert_dict.get("subjectAltName", [])
+                        protocol_version: Optional[str] = ssock.version()
+                        cipher_info: Optional[Tuple[str, str, int]] = ssock.cipher()
 
-                    results.update({
-                        "issuer": issuer_dict.get("commonName", issuer_dict.get("organizationName", "Unknown")),
-                        "san_domains": [val for type_val, val in san_tuples if type_val.lower() == 'dns'],
-                        "not_after": cert_dict.get("notAfter", ""),
-                        "serial_number": cert_dict.get("serialNumber", ""),
-                        "protocols": [protocol_version] if protocol_version else [],
-                        "cipher": cipher_info[0] if cipher_info else "",
-                        "confidence": 0.95
-                    })
-                    logger.debug(f"Analyse SSL réussie pour {ip}:{port}")
-                else:
-                    results.update({"error": "getpeercert() returned None", "confidence": 0.4})
-                    logger.warning(f"getpeercert() a retourné None pour {ip}:{port}")
+                        results.update({
+                            "issuer": issuer_dict.get("commonName", issuer_dict.get("organizationName", "Unknown")),
+                            "san_domains": [val for type_val, val in san_tuples if type_val.lower() == 'dns'],
+                            "not_after": cert_dict.get("notAfter", ""),
+                            "serial_number": cert_dict.get("serialNumber", ""),
+                            "protocols": [protocol_version] if protocol_version else [],
+                            "cipher": cipher_info[0] if cipher_info else "",
+                            "confidence": 0.95
+                        })
+                        logger.debug(f"Analyse SSL réussie pour {ip}:{port}")
+                    else:
+                        results.update({"error": "getpeercert() returned None", "confidence": 0.4})
+                        logger.warning(f"getpeercert() a retourné None pour {ip}:{port}")
 
-    except socket.timeout:
-        results.update({"error": "Socket timeout", "confidence": 0.5})
-        logger.warning(f"Timeout SSL pour {ip}:{port}")
-        self.packet_loss_count += 1
-    except ssl.SSLError as e:
-        results.update({"error": f"SSLError: {e.reason}", "confidence": 0.5})
-        logger.warning(f"Erreur SSL pour {ip}:{port} : {e.reason}", exc_info=False)
-        self.packet_loss_count += 1
-    except Exception as e:
-        results.update({"error": f"Generic error: {str(e)}", "confidence": 0.5})
-        logger.error(f"Erreur générique lors de l'analyse SSL pour {ip}:{port} : {e}", exc_info=True)
-        self.packet_loss_count += 1
-    print("Avant return", results)  # Débogage
-    return results
+        except socket.timeout:
+            results.update({"error": "Socket timeout", "confidence": 0.5})
+            logger.warning(f"Timeout SSL pour {ip}:{port}")
+            self.packet_loss_count += 1
+        except ssl.SSLError as e:
+            results.update({"error": f"SSLError: {e.reason}", "confidence": 0.5})
+            logger.warning(f"Erreur SSL pour {ip}:{port} : {e.reason}", exc_info=False)
+            self.packet_loss_count += 1
+        except Exception as e:
+            results.update({"error": f"Generic error: {str(e)}", "confidence": 0.5})
+            logger.error(f"Erreur générique lors de l'analyse SSL pour {ip}:{port} : {e}", exc_info=True)
+            self.packet_loss_count += 1
+        print("Avant return", results)  # Débogage
+        return results
 
     async def check_vulnerabilities(self, ip: str, port: int, version: str, banner: str) -> List[Dict[str, Any]]:
         """
@@ -1416,104 +1415,105 @@ def _sync_advanced_ssl_analysis(self, ip: str, port: int, hostname: Optional[str
             Dict[str, Any]: Résultats de la tentative de résolution du défi.
         """
         results: Dict[str, Any] = {"bypass_success": False, "confidence": 0.0}
-    driver = None
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver # Alias plus spécifique
-        from selenium.webdriver.chrome.options import Options as ChromeOptions # Alias
-        from selenium.webdriver.chrome.service import Service as ChromeService # Alias
-        from selenium.common.exceptions import TimeoutException as SeleniumTimeoutException
-        from selenium.common.exceptions import WebDriverException as SeleniumWebDriverException
-    except ImportError: # Devrait être capturé par la méthode appelante, mais double-vérification
-        logger.critical("Sync JS Challenge: Dépendances Selenium non trouvées (ceci ne devrait pas arriver).")
-        return {"bypass_success": False, "confidence": 0.0, "error": "Dépendances Selenium manquantes."}
+        driver = None
+        webdriver_service = None
 
-    webdriver_service = None
-    try:
-        chrome_options = ChromeOptions()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        # Utiliser un User-Agent spécifique pour Selenium pour le distinguer des requêtes aiohttp
-        chrome_options.add_argument(f"--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36 Selenium")
+        try: # Inner try specifically for imports
+            from webdriver_manager.chrome import ChromeDriverManager
+            from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver # Alias plus spécifique
+            from selenium.webdriver.chrome.options import Options as ChromeOptions # Alias
+            from selenium.webdriver.chrome.service import Service as ChromeService # Alias
+            from selenium.common.exceptions import TimeoutException as SeleniumTimeoutException
+            from selenium.common.exceptions import WebDriverException as SeleniumWebDriverException
+        except ImportError:
+            logger.critical("Sync JS Challenge: Dépendances Selenium non trouvées (ceci ne devrait pas arriver).")
+            results.update({"error": "Dépendances Selenium manquantes."}) # Update results
+            return results # Return early if imports fail
 
-        current_proxy: Optional[Dict[str, str]] = self._get_next_proxy() # Obtenir un proxy pour cette tentative Selenium
-        if current_proxy and "http" in current_proxy: # Assurer que la clé http existe
-            chrome_options.add_argument(f"--proxy-server={current_proxy['http']}")
-        
-        # Gérer l'installation et le service de ChromeDriver
-        # Le log_level=logging.WARNING réduit la verbosité de webdriver-manager
-        try:
-            webdriver_service = ChromeService(ChromeDriverManager(log_level=logging.WARNING).install())
-            driver = ChromeWebDriver(service=webdriver_service, options=chrome_options)
-        except SeleniumWebDriverException as e_wd_init:
-            logger.error(f"Sync JS Challenge: Erreur initialisation WebDriver: {e_wd_init.msg}", exc_info=False) # msg est plus concis
-            return {"bypass_success": False, "confidence": 0.2, "error": f"WebDriver init error: {e_wd_init.msg}"}
-        except ValueError as e_val_init: # Peut arriver si chromedriver n'est pas compatible
-            logger.error(f"Sync JS Challenge: Erreur valeur WebDriver (potentiel problème version chromedriver): {e_val_init}", exc_info=False)
-            return {"bypass_success": False, "confidence": 0.2, "error": f"WebDriver value error: {e_val_init}"}
+        try: # Outer try for the entire Selenium operation
+            chrome_options = ChromeOptions()
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            # Utiliser un User-Agent spécifique pour Selenium pour le distinguer des requêtes aiohttp
+            chrome_options.add_argument(f"--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36 Selenium")
 
+            current_proxy: Optional[Dict[str, str]] = self._get_next_proxy() # Obtenir un proxy pour cette tentative Selenium
+            if current_proxy and "http" in current_proxy: # Assurer que la clé http existe
+                chrome_options.add_argument(f"--proxy-server={current_proxy['http']}")
 
-        driver.set_page_load_timeout(self.config.TIMEOUT * 3) # Ex: 2s * 3 = 6s pour chargement de page
-
-        logger.debug(f"Sync JS challenge: Navigation vers {target_url} avec proxy {current_proxy.get('http') if current_proxy else 'None'}")
-        driver.get(target_url)
-        
-        # Attente initiale pour que la page se charge et que les scripts JS s'exécutent.
-        # Cette attente est cruciale pour les pages avec des défis JS.
-        time.sleep(self.config.TIMEOUT + 3) # Ex: 2s + 3s = 5s. Ajuster si nécessaire.
-
-        page_title_lower: str = driver.title.lower()
-        page_source_snippet_lower: str = driver.page_source[:1000].lower() # Examiner un extrait pour performance
-
-        # Mots-clés communs indiquant un défi JS ou une page d'attente Cloudflare
-        challenge_keywords: List[str] = ["just a moment", "checking your browser", "verify you are human", "challenge", "ray id"]
-
-        is_challenge_detected: bool = any(kw in page_title_lower or kw in page_source_snippet_lower for kw in challenge_keywords)
-
-        if is_challenge_detected:
-            logger.info(f"Sync JS challenge: Défi JS ou page d'attente détecté pour {target_url}. Attente supplémentaire.")
-            time.sleep(self.config.TIMEOUT + 7) # Attente plus longue, ex: 2s + 7s = 9s
-
-            # Ré-évaluer après l'attente
-            page_title_lower = driver.title.lower()
-            page_source_snippet_lower = driver.page_source[:1000].lower()
-            is_challenge_still_present: bool = any(kw in page_title_lower or kw in page_source_snippet_lower for kw in challenge_keywords)
-
-            if is_challenge_still_present:
-                results.update({"confidence": 0.85, "bypass_success": False, "error": "Page de défi JS persistante après attente."})
-                logger.info(f"Sync JS challenge: Échec pour {target_url}, page de défi persistante.")
-            else:
-                results.update({"bypass_success": True, "confidence": 0.95})
-                logger.info(f"Sync JS challenge: Succès apparent pour {target_url} après attente (défi résolu ou page chargée).")
-        else: # Pas de défi détecté initialement
-            results.update({"bypass_success": True, "confidence": 0.90}) # Peut-être pas de défi, ou résolu très vite
-            logger.info(f"Sync JS challenge: Aucun défi JS détecté initialement pour {target_url} ou résolu rapidement.")
-
-    except SeleniumTimeoutException as e_timeout:
-        logger.warning(f"Sync JS challenge: Timeout Selenium ({e_timeout.msg}) pour {target_url}.")
-        results.update({"confidence": 0.70, "bypass_success": False, "error": f"Timeout Selenium: {e_timeout.msg}"})
-        self.packet_loss_count += 1 # Le timeout peut être dû à des problèmes réseau
-    except SeleniumWebDriverException as e_wd: # Autres erreurs WebDriver (ex: navigateur crash)
-        logger.error(f"Sync JS challenge: Erreur WebDriver ({e_wd.msg}) pour {target_url}.", exc_info=False)
-        results.update({"confidence": 0.30, "bypass_success": False, "error": f"WebDriver error: {e_wd.msg}"})
-    except Exception as e_generic: # Erreurs inattendues
-        logger.error(f"Sync JS challenge: Erreur inattendue pour {target_url}: {e_generic}", exc_info=True)
-        results.update({"confidence": 0.50, "bypass_success": False, "error": f"Erreur inattendue: {e_generic}"})
-    finally:
-        if driver:
+            # Gérer l'installation et le service de ChromeDriver
+            # Le log_level=logging.WARNING réduit la verbosité de webdriver-manager
             try:
-                driver.quit()
-            except Exception as e_quit: # Erreur lors de la fermeture du driver
-                logger.warning(f"Sync JS challenge: Erreur lors de la fermeture de WebDriver: {e_quit}", exc_info=False)
-        if webdriver_service and hasattr(webdriver_service, 'stop'): # Arrêter le service chromedriver
-             try:
-                webdriver_service.stop()
-             except Exception as e_service_stop:
-                logger.warning(f"Sync JS challenge: Erreur lors de l'arrêt du service chromedriver: {e_service_stop}", exc_info=False)
+                webdriver_service = ChromeService(ChromeDriverManager(log_level=logging.WARNING).install())
+                driver = ChromeWebDriver(service=webdriver_service, options=chrome_options)
+            except SeleniumWebDriverException as e_wd_init:
+                logger.error(f"Sync JS Challenge: Erreur initialisation WebDriver: {e_wd_init.msg}", exc_info=False) # msg est plus concis
+                return {"bypass_success": False, "confidence": 0.2, "error": f"WebDriver init error: {e_wd_init.msg}"}
+            except ValueError as e_val_init: # Peut arriver si chromedriver n'est pas compatible
+                logger.error(f"Sync JS Challenge: Erreur valeur WebDriver (potentiel problème version chromedriver): {e_val_init}", exc_info=False)
+                return {"bypass_success": False, "confidence": 0.2, "error": f"WebDriver value error: {e_val_init}"}
 
-                return results
+
+            driver.set_page_load_timeout(self.config.TIMEOUT * 3) # Ex: 2s * 3 = 6s pour chargement de page
+
+            logger.debug(f"Sync JS challenge: Navigation vers {target_url} avec proxy {current_proxy.get('http') if current_proxy else 'None'}")
+            driver.get(target_url)
+
+            # Attente initiale pour que la page se charge et que les scripts JS s'exécutent.
+            # Cette attente est cruciale pour les pages avec des défis JS.
+            time.sleep(self.config.TIMEOUT + 3) # Ex: 2s + 3s = 5s. Ajuster si nécessaire.
+
+            page_title_lower: str = driver.title.lower()
+            page_source_snippet_lower: str = driver.page_source[:1000].lower() # Examiner un extrait pour performance
+
+            # Mots-clés communs indiquant un défi JS ou une page d'attente Cloudflare
+            challenge_keywords: List[str] = ["just a moment", "checking your browser", "verify you are human", "challenge", "ray id"]
+
+            is_challenge_detected: bool = any(kw in page_title_lower or kw in page_source_snippet_lower for kw in challenge_keywords)
+
+            if is_challenge_detected:
+                logger.info(f"Sync JS challenge: Défi JS ou page d'attente détecté pour {target_url}. Attente supplémentaire.")
+                time.sleep(self.config.TIMEOUT + 7) # Attente plus longue, ex: 2s + 7s = 9s
+
+                # Ré-évaluer après l'attente
+                page_title_lower = driver.title.lower()
+                page_source_snippet_lower = driver.page_source[:1000].lower()
+                is_challenge_still_present: bool = any(kw in page_title_lower or kw in page_source_snippet_lower for kw in challenge_keywords)
+
+                if is_challenge_still_present:
+                    results.update({"confidence": 0.85, "bypass_success": False, "error": "Page de défi JS persistante après attente."})
+                    logger.info(f"Sync JS challenge: Échec pour {target_url}, page de défi persistante.")
+                else:
+                    results.update({"bypass_success": True, "confidence": 0.95})
+                    logger.info(f"Sync JS challenge: Succès apparent pour {target_url} après attente (défi résolu ou page chargée).")
+            else: # Pas de défi détecté initialement
+                results.update({"bypass_success": True, "confidence": 0.90}) # Peut-être pas de défi, ou résolu très vite
+                logger.info(f"Sync JS challenge: Aucun défi JS détecté initialement pour {target_url} ou résolu rapidement.")
+
+        except SeleniumTimeoutException as e_timeout:
+            logger.warning(f"Sync JS challenge: Timeout Selenium ({e_timeout.msg}) pour {target_url}.")
+            results.update({"confidence": 0.70, "bypass_success": False, "error": f"Timeout Selenium: {e_timeout.msg}"})
+            self.packet_loss_count += 1 # Le timeout peut être dû à des problèmes réseau
+        except SeleniumWebDriverException as e_wd: # Autres erreurs WebDriver (ex: navigateur crash)
+            logger.error(f"Sync JS challenge: Erreur WebDriver ({e_wd.msg}) pour {target_url}.", exc_info=False)
+            results.update({"confidence": 0.30, "bypass_success": False, "error": f"WebDriver error: {e_wd.msg}"})
+        except Exception as e_generic: # Erreurs inattendues
+            logger.error(f"Sync JS challenge: Erreur inattendue pour {target_url}: {e_generic}", exc_info=True)
+            results.update({"confidence": 0.50, "bypass_success": False, "error": f"Erreur inattendue: {e_generic}"})
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception as e_quit: # Erreur lors de la fermeture du driver
+                    logger.warning(f"Sync JS challenge: Erreur lors de la fermeture de WebDriver: {e_quit}", exc_info=False)
+            if webdriver_service and hasattr(webdriver_service, 'stop'): # Arrêter le service chromedriver
+                 try:
+                    webdriver_service.stop()
+                 except Exception as e_service_stop:
+                    logger.warning(f"Sync JS challenge: Erreur lors de l'arrêt du service chromedriver: {e_service_stop}", exc_info=False)
+        return results
 
     async def cloudflare_rate_limit_evasion(self, ip: str, port: int, domain: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -2020,10 +2020,9 @@ def _sync_advanced_ssl_analysis(self, ip: str, port: int, hostname: Optional[str
         # Pour des tests, utiliser une plage de ports plus restreinte.
         # common_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 5900, 8080, 8443]
         # tasks = [self.do_full_scan_on_port(ip, port, domain) for port in common_ports]
-        tasks: List[asyncio.Task] = [
-            asyncio.create_task(self.do_full_scan_on_port(ip, port, domain)) 
-            for port in range(1, 65536) # Scan de 1 à 65535
-        ]
+        tasks: List[asyncio.Task] = []
+        for port in range(1, 65536): # Scan de 1 à 65535
+            tasks.append(asyncio.create_task(self.do_full_scan_on_port(ip, port, domain)))
         
         all_results: List[Dict[str, Any]] = []
         
@@ -2098,33 +2097,13 @@ if __name__ == "__main__":
     # le script lui-même doit être lancé avec sudo.
     # asyncio.run() est le point d'entrée standard.
 
-    async def main() -> List[Any]:
-        results = []
-        try:
-            for i in range(0, len(tasks), self.config.MAX_PARALLEL):
-                batch = tasks[i:i + self.config.MAX_PARALLEL]
-                batch_results = await asyncio.gather(*batch, return_exceptions=True)
-                for res in batch_results:
-                    if isinstance(res, dict):
-                        results.append(res)
-                    else:
-                        logger.error(f"Erreur dans le scan d'un port : {res}")
-                await asyncio.sleep(random.uniform(0.1, 0.5))  # Délai aléatoire entre batches
-        except KeyboardInterrupt:
-            logger.info("Scan interrompu par l'utilisateur.")
-        except Exception as e_global:
-            logger.critical(f"Erreur globale non gérée dans main: {e_global}", exc_info=True)
-        return results
-
-# Exemple d'utilisation
-async def main():
-    state = ScannerState(is_admin=True, executor=None)
-    scanner = NetworkScanner(state)
-    # Test avec une cible sans WAF pour validation (recommandation)
-    logger.info("Test recommandé : scan sur scanme.nmap.org ou IP directe comme 8.8.8.8")
-    result = await scanner.do_full_scan_on_port("scanme.nmap.org", 80, domain="scanme.nmap.org")  # Test avec IP nmap directe
-    #result = await scanner.do_full_scan_on_port("8.8.8.8", 53, domain=None)  # Test avec IP directe
-    print(result)
-
 if __name__ == "__main__":
+    # Configuration du logging pour l'exemple
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+    logger = logging.getLogger(__name__)  # Définir logger ici
+    logger.setLevel(logging.DEBUG)  # Mettre DEBUG pour voir plus de détails du scanner
+
+    # Note: Pour exécuter du code asyncio avec des privilèges (comme pour Scapy),
+    # le script lui-même doit être lancé avec sudo.
+    # asyncio.run() est le point d'entrée standard.
     asyncio.run(main())
